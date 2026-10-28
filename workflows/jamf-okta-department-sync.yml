@@ -1,0 +1,150 @@
+name: Jamf Department Sync (Okta -> Jamf)
+
+on:
+  schedule:
+    # Refresh department-based scoping daily at 06:17 UTC.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (log only, no writes to Jamf)'
+        type: boolean
+        default: true
+      max_change_ratio:
+        description: >
+          Abort threshold override (0.0-1.0). Default scheduled runs use
+          0.2. Use 1.0 for the first bootstrap run against a fleet where
+          no computer has a department set yet — otherwise it will abort
+          on the ~100% change ratio.
+        type: string
+        default: '0.2'
+
+permissions:
+  contents: read
+
+# A manual bootstrap run overlapping the scheduled sync would have two jobs
+# writing Location.department on the same records concurrently. Queue
+# instead of cancelling — a half-finished sync is worse than a late one.
+concurrency:
+  group: jamf-okta-department-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/main'
+    # Dedicated environment (deployments restricted to main) holds the
+    # dept-sync credentials so no other workflow can read them.
+    # SLACK_WEBHOOK_URL stays repo-level — it is shared with other workflows.
+    environment: Jamf Department Sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install -r jamf/automation/department_sync/requirements.txt
+
+      - name: Run department sync
+        id: run_sync
+        working-directory: jamf/automation/department_sync
+        env:
+          # Single production instance; not a secret.
+          JAMF_URL: https://sparkmanage.jamfcloud.com
+          # Scoped Jamf client: department-sync-scoped role, Computers
+          # Read + Update and Departments Read.
+          JAMF_CLIENT_ID: ${{ vars.JAMF_DEPT_SYNC_CLIENT_ID }}
+          JAMF_CLIENT_SECRET: ${{ secrets.JAMF_DEPT_SYNC_CLIENT_SECRET }}
+          # Okta OAuth 2.0 service app, private_key_jwt — NOT an SSWS
+          # token. Scoped to okta.users.read only via a read-only admin
+          # role — no group scope needed, this doesn't read Okta groups
+          # at all. See README for setup.
+          OKTA_DOMAIN: https://formationbio.okta.com
+          # Client IDs are public identifiers, not secrets — environment
+          # variables so they're visible when debugging auth.
+          OKTA_CLIENT_ID: ${{ vars.OKTA_CLIENT_ID }}
+          # Client-auth private key. The DPoP key pair is generated per run
+          # in memory and needs no secret.
+          OKTA_PRIVATE_KEY: ${{ secrets.OKTA_PRIVATE_KEY }}
+          OKTA_SCOPES: okta.users.read
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # workflow_dispatch inputs, passed through env rather than
+          # inlined into the shell script below (GitHub Actions
+          # hardening guidance — avoids interpolating untrusted-shaped
+          # input directly into `run:`).
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+          MAX_CHANGE_RATIO_INPUT: ${{ github.event.inputs.max_change_ratio }}
+        run: |
+          ARGS=()
+          if [ "$DRY_RUN_INPUT" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          if [ -n "$MAX_CHANGE_RATIO_INPUT" ]; then
+            ARGS+=(--max-change-ratio "$MAX_CHANGE_RATIO_INPUT")
+          fi
+          python3 sync_jamf_departments.py "${ARGS[@]}"
+
+      - name: Notify Slack — run failed
+        # Only fire when the script itself didn't already post a Slack
+        # message (summary or abort notice). On a hard crash before that
+        # point the output is unset, so this still fires as the safety net.
+        if: failure() && steps.run_sync.outputs.slack_posted != 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+          from urllib.parse import urlsplit
+
+          webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+          if not webhook:
+              print("::error::Failure notification unavailable: configure SLACK_WEBHOOK_URL.")
+              sys.exit(1)
+          try:
+              parsed = urlsplit(webhook)
+              valid = (
+                  parsed.scheme == "https" and parsed.hostname == "hooks.slack.com"
+                  and parsed.path.startswith("/services/") and parsed.port in (None, 443)
+                  and not parsed.username and not parsed.password
+                  and not parsed.query and not parsed.fragment
+              )
+          except ValueError:
+              valid = False
+          if not valid:
+              print("::error::Configure a valid HTTPS Slack incoming webhook.")
+              sys.exit(1)
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirect())
+          payload = json.dumps({
+              "text": ":x: Jamf Department Sync workflow failed. "
+                      "Review the run for aggregate results: " + os.environ["RUN_URL"]
+          }).encode("utf-8")
+          try:
+              request = urllib.request.Request(
+                  webhook, data=payload, headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              with opener.open(request, timeout=30) as response:
+                  if response.status != 200 or response.read(16).strip() != b"ok":
+                      print("::error::Slack rejected the failure notification; check webhook configuration.")
+                      sys.exit(1)
+          except (urllib.error.URLError, ValueError, TimeoutError, OSError):
+              print("::error::Failure notification could not be delivered; check Slack connectivity and webhook configuration.")
+              sys.exit(1)
+          PY
