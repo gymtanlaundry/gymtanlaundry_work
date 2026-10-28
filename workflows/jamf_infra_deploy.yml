@@ -1,0 +1,40 @@
+name: Jamf — Promote to Production
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    # Only run on Jamf Terraform changes — matches the aws/azure callers. Keeps
+    # "Jamf — Promote to Production" off unrelated PRs, including the automated
+    # drift-report PR (which touches jamf/drift-reports/ only). `main` has no required
+    # status checks today, so a paths filter here can't deadlock non-Jamf PRs. If
+    # required checks are added later, revisit (the reusable `detect` job still gates
+    # the heavy jobs, so a no-filter + skipped-as-passing model remains an option).
+    paths: ['jamf/terraform/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Do NOT cancel in-progress runs: a new push mid-apply must not SIGTERM `terraform
+  # apply` (risks a half-applied change or a stuck state lock). New pushes queue instead.
+  cancel-in-progress: false
+
+jobs:
+  # Job name becomes the status-check context prefix (jamf / validate, jamf / plan,
+  # jamf / apply). Keep it provider-unique so migrating other providers onto the same
+  # reusable workflow doesn't collide when these are required checks on main.
+  jamf:
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      provider: jamf
+      working_directory: jamf/terraform/environments/prod
+      changed_paths: '^jamf/terraform/'
+      plan_environment: jamf-plan          # ungated, holds Jamf creds for plan/validate
+      apply_environment: jamf-production    # gated (techops reviewers) — the human gate
+      lock_hcl_path: jamf/terraform/environments/prod/.terraform.lock.hcl
+    secrets: inherit
