@@ -1,0 +1,249 @@
+name: Intune Production Backup
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'  # 2am UTC every Monday (weekly)
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install IntuneCD
+        run: pip install IntuneCD pyyaml
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run backup
+        env:
+          TENANT_NAME: ${{ secrets.INTUNECD_TENANT_NAME }}
+          CLIENT_ID: ${{ secrets.INTUNECD_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.INTUNECD_CLIENT_SECRET }}
+        run: |
+          IntuneCD-startbackup \
+            -m 1 \
+            -o yaml \
+            -p ./intune/intunecd/production/backup \
+            --platforms windows \
+            --max-workers 1 \
+            --exit-on-error \
+            --verbose \
+            --exclude assignments Applications EnrollmentConfigurations \
+              DeviceManagementSettings AppleEnrollmentProfile \
+              WindowsEnrollmentProfile EnrollmentStatusPage ManagedGooglePlay \
+              ProactiveRemediation ShellScripts windowsDriverUpdates \
+              windowsFeatureUpdates windowsQualityUpdates APNs VPP
+
+      # Microsoft re-encrypts some Graph fields (e.g. the WDATP onboarding
+      # blob) with a fresh session key on every export, so the ciphertext
+      # differs every run even when nothing was actually reconfigured. Mask
+      # those known-volatile fields before diffing: if that's the only thing
+      # that changed, restore the committed version so the noise never
+      # reaches git in the first place.
+      #
+      # TODO (future work): VOLATILE_FIELDS is a manually maintained list —
+      # the Defender ATP onboarding blob is the only known instance today.
+      # If Microsoft adds similar re-encrypted-on-every-export blobs to other
+      # config types (e.g. certificate-based profiles), they won't be caught
+      # here until someone notices the noise and adds them. Also note this
+      # masking can't distinguish routine re-encryption from a genuine
+      # rotation of the underlying blob (both look like unrelated
+      # ciphertext), so a deliberate rotation would be silently swallowed
+      # too — accepted tradeoff, but worth revisiting if that field ever
+      # needs stronger change tracking.
+      - name: Normalize known-volatile encrypted fields
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          import subprocess
+          from pathlib import Path
+
+          import yaml
+
+          VOLATILE_FIELDS = {
+              "intune/intunecd/production/backup/Device Configurations/"
+              "Config-Settings-Defender_windowsDefenderAdvancedThreatProtectionConfiguration.yaml": [
+                  "advancedThreatProtectionOnboardingBlob",
+              ],
+          }
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          def log(message):
+              print(message)
+              if summary_path:
+                  with open(summary_path, "a") as f:
+                      f.write(f"- {message}\n")
+
+          for rel_path, fields in VOLATILE_FIELDS.items():
+              path = Path(rel_path)
+              if not path.exists():
+                  continue
+
+              try:
+                  committed_raw = subprocess.run(
+                      ["git", "show", f"HEAD:{rel_path}"],
+                      capture_output=True, text=True, check=True,
+                  ).stdout
+              except subprocess.CalledProcessError:
+                  continue  # nothing committed yet — let it through as a real change
+
+              fresh = yaml.safe_load(path.read_text())
+              committed = yaml.safe_load(committed_raw)
+
+              # A malformed or empty export parses to a non-dict (None, list).
+              # Don't crash the run over it — leave the fresh export untouched
+              # so it flows through as a real change for a human to look at.
+              if not isinstance(fresh, dict) or not isinstance(committed, dict):
+                  log(f"Unexpected YAML shape in {rel_path}; keeping fresh export.")
+                  continue
+
+              # Matches top-level keys only. Every field listed in
+              # VOLATILE_FIELDS must be a top-level key of the document — a
+              # nested field would never match here (fail-safe: its noise just
+              # flows through as a real change rather than being suppressed).
+              def masked(doc):
+                  return {k: (None if k in fields else v) for k, v in doc.items()}
+
+              if masked(fresh) == masked(committed):
+                  path.write_text(committed_raw)
+                  log(f"No meaningful change in {rel_path}; restored committed version.")
+              else:
+                  log(f"Real change detected in {rel_path}; keeping fresh export.")
+          PYEOF
+
+      # The Assignment Report is built by IntuneCD walking the local backup
+      # directory tree (os.walk), which has no guaranteed ordering across
+      # runs — so the group list and each group's assignedTo keys can
+      # reshuffle even when no assignment actually changed. Sort
+      # deterministically before diffing so pure reordering never produces a
+      # no-op PR.
+      - name: Normalize Assignment Report ordering
+        run: |
+          python3 - <<'PYEOF'
+          from pathlib import Path
+
+          import yaml
+
+          path = Path("intune/intunecd/production/backup/Assignment Report/report.yaml")
+          if path.exists():
+              groups = yaml.safe_load(path.read_text()) or []
+              for group in groups:
+                  assigned_to = group.get("assignedTo") or {}
+                  for payloads in assigned_to.values():
+                      payloads.sort(key=lambda p: (p.get("name") or "", p.get("intent") or ""))
+                  group["assignedTo"] = dict(sorted(assigned_to.items()))
+              groups.sort(key=lambda g: g.get("groupName") or "")
+              path.write_text(yaml.dump(groups, sort_keys=False, default_flow_style=False))
+          PYEOF
+
+      - name: Check for changes
+        id: diff
+        run: |
+          git add --all
+          if git diff --staged --quiet; then
+            echo "CHANGE_DETECTED=false" >> $GITHUB_OUTPUT
+            echo "DELETIONS_DETECTED=false" >> $GITHUB_OUTPUT
+          else
+            echo "CHANGE_DETECTED=true" >> $GITHUB_OUTPUT
+
+            FILES=$(git diff --staged --name-only | head -20 | sed 's/^/• /')
+            {
+              echo "FILES<<EOF"
+              echo "$FILES"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+
+            echo "STAT=$(git diff --staged --stat | tail -1)" >> $GITHUB_OUTPUT
+
+            DELETED=$(git diff --staged --name-only --diff-filter=D | sed 's/^/• /')
+            if [ -n "$DELETED" ]; then
+              echo "DELETIONS_DETECTED=true" >> $GITHUB_OUTPUT
+              {
+                echo "DELETED_FILES<<EOF"
+                echo "$DELETED"
+                echo "EOF"
+              } >> $GITHUB_OUTPUT
+            else
+              echo "DELETIONS_DETECTED=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Commit and open PR
+        if: steps.diff.outputs.CHANGE_DETECTED == 'true'
+        id: branch
+        run: |
+          BRANCH="intune-backup-$(date +'%Y-%m-%d-%H-%M')"
+          echo "BRANCH=$BRANCH" >> $GITHUB_OUTPUT
+          git checkout -b "$BRANCH"
+          git commit -m "Intune config backup $(date +'%Y-%m-%d %H:%M')"
+          git push origin "$BRANCH"
+          PR_URL=$(gh pr create \
+            --title "Intune Production Config Backup $(date +'%Y-%m-%d')" \
+            --body "Automated Intune backup — review and merge." \
+            --base main \
+            --head "$BRANCH")
+          echo "PR_URL=$PR_URL" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify Slack — changes detected
+        if: steps.diff.outputs.CHANGE_DETECTED == 'true' && steps.diff.outputs.DELETIONS_DETECTED == 'false'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          FILES: ${{ steps.diff.outputs.FILES }}
+          STAT: ${{ steps.diff.outputs.STAT }}
+          PR_URL: ${{ steps.branch.outputs.PR_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$(printf '{"text": ":white_check_mark: *Intune Backup — Changes Detected*\n\n%s\n\n%s\n\nReview and merge: %s\nRun: %s"}' \
+              "$(echo "$FILES" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+              "$(echo "$STAT" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+              "$PR_URL" "$RUN_URL")"
+
+      - name: Notify Slack — deletions detected
+        if: steps.diff.outputs.DELETIONS_DETECTED == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DELETED_FILES: ${{ steps.diff.outputs.DELETED_FILES }}
+          FILES: ${{ steps.diff.outputs.FILES }}
+          STAT: ${{ steps.diff.outputs.STAT }}
+          PR_URL: ${{ steps.branch.outputs.PR_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$(printf '{"text": ":warning: *Intune Backup — Deletions Detected*\n\nThe following configs were deleted from Intune:\n\n%s\n\nAll changes:\n\n%s\n\n%s\n\nReview and merge: %s\nRun: %s"}' \
+              "$(echo "$DELETED_FILES" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+              "$(echo "$FILES" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+              "$(echo "$STAT" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+              "$PR_URL" "$RUN_URL")"
+
+      - name: Notify Slack — backup FAILED
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \":red_circle: *Intune Backup — FAILED*\nBackup did not complete. Immediate attention required.\nRun: $RUN_URL\"}"
