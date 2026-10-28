@@ -1,0 +1,28 @@
+name: Jamf — Drift Detection
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly, Mondays 06:00 UTC (matches Intune's weekly cadence)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: jamf-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    uses: ./.github/workflows/terraform-drift.yml
+    with:
+      provider: jamf
+      working_directory: jamf/terraform/environments/prod
+      report_path: jamf/drift-reports/prod.md
+      branch: automated/jamf-drift
+      code_paths: '^jamf/terraform/'
+      plan_environment: jamf-plan  # ungated; holds Jamf creds. Must have no reviewers (would hang the schedule)
+      lock_hcl_path: jamf/terraform/environments/prod/.terraform.lock.hcl
+    secrets: inherit
