@@ -1,0 +1,183 @@
+name: Azure — Promote to Production
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['azure/terraform/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  plan:
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_client_id: ${{ secrets.ARM_CLIENT_ID }}
+      TF_VAR_client_secret: ${{ secrets.ARM_CLIENT_SECRET }}
+      TF_VAR_tenant_id: ${{ secrets.ARM_TENANT_ID }}
+      TF_VAR_subscription_id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      TF_VAR_vpn_shared_key_ny: ${{ secrets.TF_VAR_VPN_SHARED_KEY_NY }}
+      TF_VAR_vpn_shared_key_sas: ${{ secrets.TF_VAR_VPN_SHARED_KEY_SAS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform Init
+        working-directory: azure/terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="profile=" \
+            -backend-config="access_key=$AWS_ACCESS_KEY_ID" \
+            -backend-config="secret_key=$AWS_SECRET_ACCESS_KEY"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: azure/terraform
+        run: |
+          terraform plan -input=false -no-color -out=azure.plan
+          terraform show -no-color azure.plan > azure.showfile
+          SUMMARY=$(grep -E "Plan:|No changes." azure.showfile || echo "Unable to parse summary")
+          echo "plan_summary=$SUMMARY" >> $GITHUB_OUTPUT
+
+          if grep -q "No changes." azure.showfile; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+          chars=$(wc -c < azure.showfile)
+          if (( chars > 65536 )); then
+            echo "jumbo=true" >> $GITHUB_OUTPUT
+          else
+            echo "jumbo=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload jumbo plan
+        if: steps.plan.outputs.jumbo == 'true'
+        id: jumbo
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: azure-showfile
+          path: azure/terraform/azure.showfile
+
+      - name: Post Slack — Plan Ready for Approval
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SUMMARY="${{ steps.plan.outputs.plan_summary }}"
+          HAS_CHANGES="${{ steps.plan.outputs.has_changes }}"
+          JUMBO="${{ steps.plan.outputs.jumbo }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+
+          if [ "$HAS_CHANGES" = "false" ]; then
+            PLAN_TEXT="✅ No changes detected."
+          elif [ "$JUMBO" = "true" ]; then
+            PLAN_TEXT="📎 Plan too large to display — see artifact in run logs.\n\`${SUMMARY}\`"
+          else
+            PLAN_CONTENT=$(cat azure/terraform/azure.showfile | head -c 2900 | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/' | tr -d '\n')
+            PLAN_TEXT="\`\`\`${PLAN_CONTENT}\`\`\`"
+          fi
+
+          curl -X POST -H "Content-type: application/json" \
+          --data "{
+            \"blocks\": [
+              {\"type\": \"header\", \"text\": {\"type\": \"plain_text\", \"text\": \"🟡 Azure — Plan Ready for Approval\", \"emoji\": true}},
+              {\"type\": \"section\", \"fields\": [
+                {\"type\": \"mrkdwn\", \"text\": \"*Summary:*\n\`${SUMMARY}\`\"}
+              ]},
+              {\"type\": \"section\", \"text\": {\"type\": \"mrkdwn\", \"text\": \"${PLAN_TEXT}\"}},
+              {\"type\": \"actions\", \"elements\": [
+                {\"type\": \"button\", \"text\": {\"type\": \"plain_text\", \"text\": \"Approve & Apply\", \"emoji\": true}, \"url\": \"${RUN_URL}\", \"style\": \"primary\"}
+              ]}
+            ]
+          }" ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  apply:
+    needs: plan
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_client_id: ${{ secrets.ARM_CLIENT_ID }}
+      TF_VAR_client_secret: ${{ secrets.ARM_CLIENT_SECRET }}
+      TF_VAR_tenant_id: ${{ secrets.ARM_TENANT_ID }}
+      TF_VAR_subscription_id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      TF_VAR_vpn_shared_key_ny: ${{ secrets.TF_VAR_VPN_SHARED_KEY_NY }}
+      TF_VAR_vpn_shared_key_sas: ${{ secrets.TF_VAR_VPN_SHARED_KEY_SAS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform Init
+        working-directory: azure/terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="profile=" \
+            -backend-config="access_key=$AWS_ACCESS_KEY_ID" \
+            -backend-config="secret_key=$AWS_SECRET_ACCESS_KEY"
+
+      - name: Terraform Apply
+        working-directory: azure/terraform
+        run: terraform apply -input=false -auto-approve
+
+      - name: Post Slack — Applied to Production
+        if: success()
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_URL="https://github.com/${{ github.repository }}/commit/${COMMIT_SHA}"
+
+          curl -X POST -H "Content-type: application/json" \
+          --data "{
+            \"blocks\": [
+              {\"type\": \"header\", \"text\": {\"type\": \"plain_text\", \"text\": \"✅ Your changes have been pushed to production — Azure\", \"emoji\": true}},
+              {\"type\": \"section\", \"fields\": [
+                {\"type\": \"mrkdwn\", \"text\": \"*Commit:*\n<${COMMIT_URL}|\`${COMMIT_SHA:0:7}\`>\"}
+              ]},
+              {\"type\": \"actions\", \"elements\": [
+                {\"type\": \"button\", \"text\": {\"type\": \"plain_text\", \"text\": \"View Logs\", \"emoji\": true}, \"url\": \"${RUN_URL}\", \"style\": \"primary\"}
+              ]}
+            ]
+          }" ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Post Slack — Apply Failed
+        if: failure()
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_URL="https://github.com/${{ github.repository }}/commit/${COMMIT_SHA}"
+
+          curl -X POST -H "Content-type: application/json" \
+          --data "{
+            \"blocks\": [
+              {\"type\": \"header\", \"text\": {\"type\": \"plain_text\", \"text\": \"🔴 Azure — Apply FAILED\", \"emoji\": true}},
+              {\"type\": \"section\", \"text\": {\"type\": \"mrkdwn\", \"text\": \"Terraform apply failed.\n\n*Commit:* <${COMMIT_URL}|\`${COMMIT_SHA:0:7}\`>\"}},
+              {\"type\": \"actions\", \"elements\": [
+                {\"type\": \"button\", \"text\": {\"type\": \"plain_text\", \"text\": \"🔍 View Failure Logs\", \"emoji\": true}, \"url\": \"${RUN_URL}\", \"style\": \"danger\"}
+              ]}
+            ]
+          }" ${{ secrets.SLACK_WEBHOOK_URL }}
