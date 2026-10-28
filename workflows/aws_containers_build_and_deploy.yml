@@ -1,0 +1,220 @@
+name: AWS — Containers — Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'aws/containers/snipe-it/**'
+      - 'aws/containers/munkireport/**'
+      - 'aws/containers/grav/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'aws/containers/snipe-it/**'
+      - 'aws/containers/munkireport/**'
+      - 'aws/containers/grav/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: 758947042183
+
+jobs:
+
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      snipe-it: ${{ steps.filter.outputs.snipe-it }}
+      munkireport: ${{ steps.filter.outputs.munkireport }}
+      grav: ${{ steps.filter.outputs.grav }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            snipe-it:
+              - 'aws/containers/snipe-it/**'
+            munkireport:
+              - 'aws/containers/munkireport/**'
+            grav:
+              - 'aws/containers/grav/**'
+
+  build-snipe-it:
+    needs: changes
+    if: needs.changes.outputs.snipe-it == 'true'
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials
+        run: |
+          mkdir -p ~/.aws
+          printf "[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n[session]\naws_access_key_id = %s\naws_secret_access_key = %s\n" \
+            "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+            "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+            > ~/.aws/credentials
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | \
+          docker login --username AWS --password-stdin \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Build and push snipe-it
+        run: |
+          IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/containers/snipe-it:prod
+          docker build -t $IMAGE aws/containers/snipe-it/
+          docker push $IMAGE
+
+      - name: Force new ECS deployment
+        if: github.ref == 'refs/heads/main'
+        run: |
+          aws ecs update-service \
+            --cluster ec2_containers \
+            --service snipe-it_prod \
+            --force-new-deployment \
+            --region $AWS_REGION
+
+      - name: Post Slack — snipe-it deployed
+        if: success() && github.ref == 'refs/heads/main'
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_URL="https://github.com/${{ github.repository }}/commit/${COMMIT_SHA}"
+          printf '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"✅ snipe-it — New image deployed to ECS","emoji":true}},{"type":"section","fields":[{"type":"mrkdwn","text":"*Commit:*\n<%s|`%s`>"}]},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"View Logs","emoji":true},"url":"%s","style":"primary"}]}]}' \
+            "$COMMIT_URL" "${COMMIT_SHA:0:7}" "$RUN_URL" | \
+          curl -X POST -H "Content-type: application/json" -d @- ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Post Slack — snipe-it failed
+        if: failure()
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          printf '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"🔴 snipe-it — Build or deploy FAILED","emoji":true}},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"🔍 View Failure Logs","emoji":true},"url":"%s","style":"danger"}]}]}' \
+            "$RUN_URL" | \
+          curl -X POST -H "Content-type: application/json" -d @- ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  build-munkireport:
+    needs: changes
+    if: needs.changes.outputs.munkireport == 'true'
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials
+        run: |
+          mkdir -p ~/.aws
+          printf "[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n[session]\naws_access_key_id = %s\naws_secret_access_key = %s\n" \
+            "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+            "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+            > ~/.aws/credentials
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | \
+          docker login --username AWS --password-stdin \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Build and push munkireport
+        run: |
+          IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/containers/munkireport:prod
+          docker build -t $IMAGE aws/containers/munkireport/
+          docker push $IMAGE
+
+      - name: Force new ECS deployment
+        if: github.ref == 'refs/heads/main'
+        run: |
+          aws ecs update-service \
+            --cluster ec2_containers \
+            --service munkireport_prod \
+            --force-new-deployment \
+            --region $AWS_REGION
+
+      - name: Post Slack — munkireport deployed
+        if: success() && github.ref == 'refs/heads/main'
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_URL="https://github.com/${{ github.repository }}/commit/${COMMIT_SHA}"
+          printf '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"✅ munkireport — New image deployed to ECS","emoji":true}},{"type":"section","fields":[{"type":"mrkdwn","text":"*Commit:*\n<%s|`%s`>"}]},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"View Logs","emoji":true},"url":"%s","style":"primary"}]}]}' \
+            "$COMMIT_URL" "${COMMIT_SHA:0:7}" "$RUN_URL" | \
+          curl -X POST -H "Content-type: application/json" -d @- ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Post Slack — munkireport failed
+        if: failure()
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          printf '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"🔴 munkireport — Build or deploy FAILED","emoji":true}},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"🔍 View Failure Logs","emoji":true},"url":"%s","style":"danger"}]}]}' \
+            "$RUN_URL" | \
+          curl -X POST -H "Content-type: application/json" -d @- ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  build-grav:
+    needs: changes
+    if: needs.changes.outputs.grav == 'true'
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials
+        run: |
+          mkdir -p ~/.aws
+          printf "[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n[session]\naws_access_key_id = %s\naws_secret_access_key = %s\n" \
+            "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+            "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+            > ~/.aws/credentials
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | \
+          docker login --username AWS --password-stdin \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Build and push grav
+        run: |
+          IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/containers/grav:prod
+          docker build -t $IMAGE aws/containers/grav/
+          docker push $IMAGE
+
+      - name: Force new ECS deployment
+        if: github.ref == 'refs/heads/main'
+        run: |
+          aws ecs update-service \
+            --cluster ec2_containers \
+            --service grav_prod \
+            --force-new-deployment \
+            --region $AWS_REGION
+
+      - name: Post Slack — grav deployed
+        if: success() && github.ref == 'refs/heads/main'
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_URL="https://github.com/${{ github.repository }}/commit/${COMMIT_SHA}"
+          printf '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"✅ grav — New image deployed to ECS","emoji":true}},{"type":"section","fields":[{"type":"mrkdwn","text":"*Commit:*\n<%s|`%s`>"}]},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"View Logs","emoji":true},"url":"%s","style":"primary"}]}]}' \
+            "$COMMIT_URL" "${COMMIT_SHA:0:7}" "$RUN_URL" | \
+          curl -X POST -H "Content-type: application/json" -d @- ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Post Slack — grav failed
+        if: failure()
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          printf '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"🔴 grav — Build or deploy FAILED","emoji":true}},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"🔍 View Failure Logs","emoji":true},"url":"%s","style":"danger"}]}]}' \
+            "$RUN_URL" | \
+          curl -X POST -H "Content-type: application/json" -d @- ${{ secrets.SLACK_WEBHOOK_URL }}
